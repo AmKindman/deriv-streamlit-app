@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import json
-import time
 from websocket import create_connection
 from collections import deque
 
@@ -33,19 +32,29 @@ fast_span = st.sidebar.slider("Fast EMA Span", min_value=3, max_value=15, value=
 slow_span = st.sidebar.slider("Slow EMA Span", min_value=10, max_value=50, value=20)
 confidence_threshold = st.sidebar.slider("Signal Threshold (%)", min_value=10, max_value=80, value=30)
 
-run_stream = st.sidebar.button("▶ Start Live Stream", type="primary")
+# Toggle streaming state
+if "streaming" not in st.session_state:
+    st.session_state.streaming = False
 
-# --- SESSION STATE INITIALISATION ---
+col_start, col_stop = st.sidebar.columns(2)
+if col_start.button("▶ Start", type="primary"):
+    st.session_state.streaming = True
+if col_stop.button("⏹ Stop"):
+    st.session_state.streaming = False
+
+# --- SESSION STATE BUFFERS ---
 if "ticks" not in st.session_state:
     st.session_state.ticks = deque(maxlen=60)
+
+if "ws" not in st.session_state:
+    st.session_state.ws = None
 
 # --- PREDICTIVE ENGINE ---
 def analyze_ticks(ticks_list):
     df = pd.DataFrame(ticks_list)
     if len(df) < slow_span:
-        needed = slow_span - len(df)
         return {
-            "prediction": f"WARMING UP ({len(df)}/{slow_span})",
+            "prediction": f"BUILDING BUFFER ({len(df)}/{slow_span})",
             "confidence": 0.0,
             "fast_ema": 0,
             "slow_ema": 0,
@@ -82,55 +91,59 @@ def analyze_ticks(ticks_list):
         "latest": round(latest_price, 3)
     }
 
-# --- DASHBOARD LAYOUT placeholders ---
+# --- DASHBOARD METRICS DISPLAY ---
+res = analyze_ticks(st.session_state.ticks)
+
 metric_col1, metric_col2, metric_col3 = st.columns(3)
-with metric_col1:
-    price_placeholder = st.empty()
-with metric_col2:
-    signal_placeholder = st.empty()
-with metric_col3:
-    confidence_placeholder = st.empty()
+metric_col1.metric("Latest Price", f"{res['latest']}")
+metric_col2.metric("Market Prediction", res['prediction'])
+metric_col3.metric("Signal Strength", f"{res['confidence']}%")
 
-chart_placeholder = st.empty()
+# Render Chart if data exists
+if len(st.session_state.ticks) > 0:
+    df_chart = pd.DataFrame(st.session_state.ticks).set_index("time")
+    st.line_chart(df_chart['price'])
 
-# --- STREAMING LOOP ---
-if run_stream:
-    st.info(f"Connecting to Deriv WebSocket for {selected_label}...")
-    
+# --- REAL-TIME TICK FETCH ENGINE ---
+if st.session_state.streaming:
     try:
-        ws = create_connection("wss://ws.derivws.com/websockets/v3?app_id=1089")
-        ws.send(json.dumps({"ticks": symbol, "subscribe": 1}))
+        # Establish WebSocket connection if not already connected
+        if st.session_state.ws is None:
+            ws = create_connection("wss://ws.derivws.com/websockets/v3?app_id=1089", timeout=3)
+            ws.send(json.dumps({"ticks": symbol, "subscribe": 1}))
+            st.session_state.ws = ws
+
+        # Receive single tick
+        result = st.session_state.ws.recv()
+        data = json.loads(result)
         
-        # Loop for live tick streaming
-        while True:
-            result = ws.recv()
-            data = json.loads(result)
+        if "tick" in data:
+            price = float(data["tick"]["quote"])
+            epoch = data["tick"]["epoch"]
+            st.session_state.ticks.append({
+                "time": pd.to_datetime(epoch, unit='s'),
+                "price": price
+            })
             
-            if "tick" in data:
-                price = float(data["tick"]["quote"])
-                epoch = data["tick"]["epoch"]
-                
-                # Append to rolling buffer
-                st.session_state.ticks.append({
-                    "time": pd.to_datetime(epoch, unit='s'),
-                    "price": price
-                })
-                
-                # Calculate indicators
-                res = analyze_ticks(st.session_state.ticks)
-                
-                # Render Real-Time Dashboard UI
-                price_placeholder.metric("Latest Price", f"{res['latest']}")
-                signal_placeholder.metric("Market Prediction", res['prediction'])
-                confidence_placeholder.metric("Signal Strength", f"{res['confidence']}%")
-                
-                # Render Dynamic Line Chart
-                df_chart = pd.DataFrame(st.session_state.ticks).set_index("time")
-                chart_placeholder.line_chart(df_chart['price'])
-                
-            time.sleep(0.1)
+        # Trigger immediate Streamlit UI refresh for next tick
+        st.rerun()
 
     except Exception as e:
-        st.error(f"Connection lost: {e}. Please click 'Start Live Stream' to reconnect.")
+        # Reset connection on failure/timeout
+        if st.session_state.ws:
+            try:
+                st.session_state.ws.close()
+            except:
+                pass
+        st.session_state.ws = None
+        st.warning("Reconnecting to live data stream...")
+        st.rerun()
 else:
-    st.warning("Click '▶ Start Live Stream' in the sidebar to initiate real-time market analysis.")
+    # Close socket when stopped
+    if st.session_state.ws is not None:
+        try:
+            st.session_state.ws.close()
+        except:
+            pass
+        st.session_state.ws = None
+    st.info("Click **▶ Start** in the sidebar to stream live ticks.")
