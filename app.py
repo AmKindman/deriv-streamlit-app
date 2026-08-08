@@ -2,13 +2,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import json
-import asyncio
-import websockets
+import time
+from websocket import create_connection
 from collections import deque
 
 # --- STREAMLIT PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="Deriv Market Predictor",
+    page_title="Live Deriv Market Predictor",
     page_icon="📈",
     layout="wide"
 )
@@ -18,17 +18,16 @@ st.caption("Real-Time Quantitative Momentum Analysis using Deriv WebSocket API")
 
 # --- SIDEBAR CONTROLS ---
 st.sidebar.header("Strategy Settings")
-symbol = st.sidebar.selectbox(
-    "Select Synthetic Index",
-    ["1HZ100V", "1HZ75V", "1HZ50V", "1HZ25V", "1HZ10V"],
-    format_func=lambda x: {
-        "1HZ100V": "Volatility 100 (1s) Index",
-        "1HZ75V": "Volatility 75 (1s) Index",
-        "1HZ50V": "Volatility 50 (1s) Index",
-        "1HZ25V": "Volatility 25 (1s) Index",
-        "1HZ10V": "Volatility 10 (1s) Index"
-    }.get(x, x)
-)
+symbol_map = {
+    "Volatility 100 (1s) Index": "1HZ100V",
+    "Volatility 75 (1s) Index": "1HZ75V",
+    "Volatility 50 (1s) Index": "1HZ50V",
+    "Volatility 25 (1s) Index": "1HZ25V",
+    "Volatility 10 (1s) Index": "1HZ10V"
+}
+
+selected_label = st.sidebar.selectbox("Select Synthetic Index", list(symbol_map.keys()))
+symbol = symbol_map[selected_label]
 
 fast_span = st.sidebar.slider("Fast EMA Span", min_value=3, max_value=15, value=5)
 slow_span = st.sidebar.slider("Slow EMA Span", min_value=10, max_value=50, value=20)
@@ -38,13 +37,20 @@ run_stream = st.sidebar.button("▶ Start Live Stream", type="primary")
 
 # --- SESSION STATE INITIALISATION ---
 if "ticks" not in st.session_state:
-    st.session_state.ticks = deque(maxlen=100)
+    st.session_state.ticks = deque(maxlen=60)
 
 # --- PREDICTIVE ENGINE ---
 def analyze_ticks(ticks_list):
     df = pd.DataFrame(ticks_list)
     if len(df) < slow_span:
-        return {"prediction": "WARMING UP", "confidence": 0.0, "fast_ema": 0, "slow_ema": 0, "latest": df['price'].iloc[-1]}
+        needed = slow_span - len(df)
+        return {
+            "prediction": f"WARMING UP ({len(df)}/{slow_span})",
+            "confidence": 0.0,
+            "fast_ema": 0,
+            "slow_ema": 0,
+            "latest": df['price'].iloc[-1] if not df.empty else 0
+        }
     
     # Calculate Exponential Moving Averages
     df['fast_ema'] = df['price'].ewm(span=fast_span, adjust=False).mean()
@@ -76,7 +82,7 @@ def analyze_ticks(ticks_list):
         "latest": round(latest_price, 3)
     }
 
-# --- DASHBOARD LAYOUT ---
+# --- DASHBOARD LAYOUT placeholders ---
 metric_col1, metric_col2, metric_col3 = st.columns(3)
 with metric_col1:
     price_placeholder = st.empty()
@@ -87,39 +93,44 @@ with metric_col3:
 
 chart_placeholder = st.empty()
 
-# --- WEBSOCKET STREAMING ENGINE ---
-async def fetch_deriv_data():
-    uri = "wss://ws.derivws.com/websockets/v3?app_id=1089"
-    async with websockets.connect(uri) as ws:
-        await ws.send(json.dumps({"ticks": symbol, "subscribe": 1}))
+# --- STREAMING LOOP ---
+if run_stream:
+    st.info(f"Connecting to Deriv WebSocket for {selected_label}...")
+    
+    try:
+        ws = create_connection("wss://ws.derivws.com/websockets/v3?app_id=1089")
+        ws.send(json.dumps({"ticks": symbol, "subscribe": 1}))
         
+        # Loop for live tick streaming
         while True:
-            response = await ws.recv()
-            data = json.loads(response)
+            result = ws.recv()
+            data = json.loads(result)
             
             if "tick" in data:
                 price = float(data["tick"]["quote"])
                 epoch = data["tick"]["epoch"]
                 
-                st.session_state.ticks.append({"time": pd.to_datetime(epoch, unit='s'), "price": price})
+                # Append to rolling buffer
+                st.session_state.ticks.append({
+                    "time": pd.to_datetime(epoch, unit='s'),
+                    "price": price
+                })
                 
-                # Analyze market state
+                # Calculate indicators
                 res = analyze_ticks(st.session_state.ticks)
                 
-                # Update Dashboard UI
+                # Render Real-Time Dashboard UI
                 price_placeholder.metric("Latest Price", f"{res['latest']}")
                 signal_placeholder.metric("Market Prediction", res['prediction'])
                 confidence_placeholder.metric("Signal Strength", f"{res['confidence']}%")
                 
-                # Render Live Line Chart
+                # Render Dynamic Line Chart
                 df_chart = pd.DataFrame(st.session_state.ticks).set_index("time")
                 chart_placeholder.line_chart(df_chart['price'])
                 
-            await asyncio.sleep(0.1)
+            time.sleep(0.1)
 
-# Execution trigger
-if run_stream:
-    st.info("Connected to Deriv API. Streaming real-time tick analysis...")
-    asyncio.run(fetch_deriv_data())
+    except Exception as e:
+        st.error(f"Connection lost: {e}. Please click 'Start Live Stream' to reconnect.")
 else:
-    st.warning("Click 'Start Live Stream' in the sidebar to initiate real-time market analysis.")
+    st.warning("Click '▶ Start Live Stream' in the sidebar to initiate real-time market analysis.")
